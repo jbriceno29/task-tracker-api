@@ -1,6 +1,13 @@
 import { Router, type Request, type Response } from 'express';
 import db from '../db.js';
-import { PRIORITIES, toTask, type Priority, type TaskRow } from '../types.js';
+import { toTask, type TaskRow } from '../types.js';
+import {
+  bulkCompleteSchema,
+  createTaskSchema,
+  formatZodError,
+  listQuerySchema,
+  updateTaskSchema,
+} from '../validation.js';
 
 export const tasksRouter = Router();
 
@@ -12,30 +19,15 @@ const insertStmt = db.prepare(
 );
 const deleteStmt = db.prepare('DELETE FROM tasks WHERE id = ?');
 
-/** Parse and validate a route `:id` param, returning null when invalid. */
-function parseId(raw: string): number | null {
-  const id = Number(raw);
-  return Number.isInteger(id) && id > 0 ? id : null;
-}
-
-const PRIORITY_ERROR = `Field "priority" must be one of: ${PRIORITIES.join(', ')}.`;
-const COMPLETED_ERROR = 'Field "completed" must be "true" or "false".';
-const DUE_DATE_ERROR =
-  'Field "due_date" must be a valid date in YYYY-MM-DD format or null.';
-
-/** True for a valid priority value (case-sensitive). */
-function isValidPriority(value: unknown): value is Priority {
-  return typeof value === 'string' && (PRIORITIES as readonly string[]).includes(value);
-}
-
 /**
- * True when `s` is a real calendar date in strict `YYYY-MM-DD` form. The
- * round-trip check rejects impossible dates such as 2026-02-30 or 2026-13-01.
+ * Parse and validate a route `:id` param, returning null when invalid. Only
+ * plain positive decimal integers are accepted ("1.0", "1e2", " 1", "0x10" and
+ * leading zeros are rejected).
  */
-function isValidDateOnly(s: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
-  const d = new Date(s + 'T00:00:00Z');
-  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+function parseId(raw: string): number | null {
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const id = Number(raw);
+  return Number.isSafeInteger(id) ? id : null;
 }
 
 /**
@@ -46,15 +38,11 @@ function isValidDateOnly(s: string): boolean {
  * Invalid, empty or repeated values return 400. Unknown params are ignored.
  */
 tasksRouter.get('/', (req: Request, res: Response) => {
-  const { completed, priority } = req.query;
-
-  if (completed !== undefined && completed !== 'true' && completed !== 'false') {
-    return res.status(400).json({ error: COMPLETED_ERROR });
+  const parsed = listQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error));
   }
-
-  if (priority !== undefined && !isValidPriority(priority)) {
-    return res.status(400).json({ error: PRIORITY_ERROR });
-  }
+  const { completed, priority } = parsed.data;
 
   if (completed === undefined && priority === undefined) {
     const rows = listStmt.all() as TaskRow[];
@@ -85,33 +73,45 @@ tasksRouter.get('/', (req: Request, res: Response) => {
  * "due_date"?: "YYYY-MM-DD" | null }.
  */
 tasksRouter.post('/', (req: Request, res: Response) => {
-  const { title, priority, due_date } = req.body ?? {};
-
-  if (typeof title !== 'string' || title.trim().length === 0) {
-    return res
-      .status(400)
-      .json({ error: 'Field "title" is required and must be a non-empty string.' });
+  const parsed = createTaskSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error));
   }
+  const data = parsed.data;
 
-  if (priority !== undefined && !isValidPriority(priority)) {
-    return res.status(400).json({ error: PRIORITY_ERROR });
-  }
-
-  if (
-    due_date !== undefined &&
-    due_date !== null &&
-    (typeof due_date !== 'string' || !isValidDateOnly(due_date))
-  ) {
-    return res.status(400).json({ error: DUE_DATE_ERROR });
-  }
-
-  const info = insertStmt.run(
-    title.trim(),
-    priority === undefined ? 'medium' : priority,
-    due_date === undefined ? null : due_date,
-  );
+  const info = insertStmt.run(data.title, data.priority ?? 'medium', data.due_date ?? null);
   const row = getStmt.get(info.lastInsertRowid) as TaskRow;
   res.status(201).json(toTask(row));
+});
+
+// Registered before the "/:id" routes so the literal path "/bulk-complete"
+// is matched explicitly and never treated as a task id.
+/**
+ * POST /tasks/bulk-complete
+ * Mark several tasks as completed from { "ids": number[] }. Other body fields
+ * are ignored. Responds 200 { "updated": n } where n is the number of tasks
+ * that actually changed from pending to completed. Tasks that were already
+ * completed and unknown ids are ignored and not counted, so repeating the same
+ * request returns { "updated": 0 } (all unknown -> { "updated": 0 }, no 404).
+ * Duplicate ids are silently deduped.
+ * Validation (400, first error wins): "ids" must be a non-empty array, with at
+ * most 500 elements (counted before dedupe), each a positive safe integer of
+ * type number (no coercion: "3" is rejected). Any invalid id rejects the whole
+ * request and nothing is updated.
+ */
+tasksRouter.post('/bulk-complete', (req: Request, res: Response) => {
+  const parsed = bulkCompleteSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error));
+  }
+
+  const uniqueIds = [...new Set(parsed.data.ids)];
+  const placeholders = uniqueIds.map(() => '?').join(',');
+  const info = db
+    .prepare(`UPDATE tasks SET completed = 1 WHERE completed = 0 AND id IN (${placeholders})`)
+    .run(...uniqueIds);
+
+  res.json({ updated: info.changes });
 });
 
 /**
@@ -129,56 +129,33 @@ tasksRouter.patch('/:id', (req: Request, res: Response) => {
     return res.status(404).json({ error: `Task ${id} not found.` });
   }
 
-  const { title, completed, priority, due_date } = req.body ?? {};
+  const parsed = updateTaskSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error));
+  }
+  const { title, completed, priority, due_date } = parsed.data;
+
   const updates: string[] = [];
   const values: (string | number | null)[] = [];
 
   if (title !== undefined) {
-    if (typeof title !== 'string' || title.trim().length === 0) {
-      return res
-        .status(400)
-        .json({ error: 'Field "title" must be a non-empty string.' });
-    }
     updates.push('title = ?');
-    values.push(title.trim());
+    values.push(title);
   }
 
   if (completed !== undefined) {
-    if (typeof completed !== 'boolean') {
-      return res
-        .status(400)
-        .json({ error: 'Field "completed" must be a boolean.' });
-    }
     updates.push('completed = ?');
     values.push(completed ? 1 : 0);
   }
 
   if (priority !== undefined) {
-    if (!isValidPriority(priority)) {
-      return res.status(400).json({ error: PRIORITY_ERROR });
-    }
     updates.push('priority = ?');
     values.push(priority);
   }
 
   if (due_date !== undefined) {
-    if (
-      due_date !== null &&
-      (typeof due_date !== 'string' || !isValidDateOnly(due_date))
-    ) {
-      return res.status(400).json({ error: DUE_DATE_ERROR });
-    }
     updates.push('due_date = ?');
     values.push(due_date);
-  }
-
-  if (updates.length === 0) {
-    return res
-      .status(400)
-      .json({
-        error:
-          'Provide at least one of "title", "completed", "priority" or "due_date" to update.',
-      });
   }
 
   values.push(id);
