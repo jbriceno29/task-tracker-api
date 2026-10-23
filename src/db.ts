@@ -11,15 +11,21 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
 
-const dataDir = path.join(projectRoot, 'data');
-const dbPath = path.join(dataDir, 'tasks.db');
+/**
+ * Database location: `DB_PATH` if set and non-empty (relative paths resolve
+ * against the cwd; `:memory:` opens an in-memory database), else
+ * `data/tasks.db` (also when `DB_PATH` is the empty string).
+ */
+export const dbPath = process.env.DB_PATH || path.join(projectRoot, 'data', 'tasks.db');
 const schemaPath = path.join(projectRoot, 'schema.sql');
 const seedPath = path.join(projectRoot, 'seed.sql');
 
-// Ensure the data/ directory exists before opening the database file.
-fs.mkdirSync(dataDir, { recursive: true });
+// Ensure the parent directory exists before opening the database file.
+if (dbPath !== ':memory:') {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+}
 
-// Open (or create) the SQLite database file.
+// Open (or create) the SQLite database (file or in-memory).
 export const db: DatabaseType = new Database(dbPath);
 
 // Recommended pragmas for a local, single-file app.
